@@ -1,0 +1,20 @@
+{
+    "train_set": "./data/processed/datasets/amazon/en.train.jsonl",
+    "dev_set": "./data/processed/datasets/amazon/en.dev.jsonl",
+    "vocab": {
+        "words": "./data/processed/datasets/amazon/en.train.words",
+        "labels": "./data/processed/datasets/amazon/en.train.labels"
+    },
+    "model": {
+        "emb_dim": 300,
+        "dropout": 0.2,
+        "update_emb": false,
+        "emb_path": "./data/processed/wordemb/wiki.en.vec"
+    },
+    "training": {
+        "num_epoch": 20,
+        "batchsize": 32,
+        "device": "cuda"
+    }
+}
+

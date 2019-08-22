@@ -1,0 +1,21 @@
+{
+    "train_set": "./data/processed/datasets/rcv/pt.train.jsonl",
+    "dev_set": "./data/processed/datasets/rcv/pt.dev.jsonl",
+    "vocab": {
+        "words": "./data/processed/datasets/rcv/pt.train.words",
+        "labels": "./data/processed/datasets/rcv/pt.train.labels"
+    },
+    "model": {
+        "emb_dim": 300,
+        "dropout": 0.2,
+        "update_emb": true,
+        "emb_path": "./data/processed/wordemb/wiki.pt.vec"
+    },
+    "training": {
+        "num_epoch": 20,
+        "batchsize": 32,
+        "device": "cuda"
+    }
+}
+
+

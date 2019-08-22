@@ -1,0 +1,1 @@
+from lib.predictors.simple_predictor import SimplePredictor

@@ -1,0 +1,13 @@
+{
+    "n_vocab": 10000,
+    "categories": {
+        "positive": {
+            "marker": "ro",
+            "path": "./sentiment-words/positive_words_ja.txt"
+        },
+        "negative": {
+            "marker": "bx",
+            "path": "./sentiment-words/negative_words_ja.txt"
+        }
+    }
+}
