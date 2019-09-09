@@ -1,13 +1,19 @@
 import json
 from pathlib import Path
+import logging
 
 import click
 import numpy as np
 import torch
+import cupy
 
 from data import Vocab, Dataset
 from model import MultiClassModel
 from config import Config
+
+logger = logging.getLogger(__name__)
+LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(message)s (%(funcName)s@%(filename)s:%(lineno)s)'
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
 def compute_accuracy(x, y):
     return torch.mean((x == y).float())
