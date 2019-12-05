@@ -7,3 +7,5 @@ vecmap
 output
 *.ipynb
 embeddings/
+alpha/
+weights/
