@@ -1,4 +1,5 @@
 import sys
+import logging
 
 import click
 import numpy as np
@@ -6,22 +7,85 @@ import cupy
 from cupy import cuda
 from tqdm import tqdm
 
-from gpu_utils import inv_gpu
-
+logger = logging.getLogger(__name__)
 LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(message)s (%(funcName)s@%(filename)s:%(lineno)s)'
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
-logger = logging.getLogger(__name__)
+def _as_batch_mat(x):
+    return x.reshape(len(x), x.shape[1], -1)
+
+def _mat_ptrs(a):
+    if len(a) == 1:
+        return cupy.full((1,), a.data.ptr, dtype=np.uintp)
+    else:
+        stride = a.strides[0]
+        ptr = a.data.ptr
+        out = cupy.arange(ptr, ptr + stride * len(a), stride, dtype=np.uintp)
+        return out
+
+
+def _get_ld(a):
+    strides = a.strides[-2:]
+    trans = np.argmin(strides)
+    return trans, int(max(a.shape[trans - 2], max(strides) // a.itemsize))
+
+
+def inv_gpu(b):
+    # We do a batched LU decomposition on the GPU to compute the inverse
+    # Change the shape of the array to be size=1 minibatch if necessary
+    # Also copy the matrix as the elments will be modified in-place
+    a = _as_batch_mat(b).copy()
+    n = a.shape[1]
+    n_matrices = len(a)
+    # Pivot array
+    p = cupy.empty((n, n_matrices), dtype=np.int32)
+    # Output array
+    c = cupy.empty_like(a)
+    # These arrays hold information on the execution success
+    # or if the matrix was singular
+    info = cupy.empty(n_matrices, dtype=np.int32)
+    ap = _mat_ptrs(a)
+    cp = _mat_ptrs(c)
+    _, lda = _get_ld(a)
+    _, ldc = _get_ld(c)
+    handle = cuda.Device().cublas_handle
+    cuda.cublas.sgetrfBatched(
+        handle, n, ap.data.ptr, lda, p.data.ptr, info.data.ptr, n_matrices)
+    cuda.cublas.sgetriBatched(
+        handle, n, ap.data.ptr, lda, p.data.ptr, cp.data.ptr, ldc,
+        info.data.ptr, n_matrices)
+    return c
+
+def load_emb(f):
+    n_vocab, dim = f.readline().strip().split()
+    n_vocab, dim = int(n_vocab), int(dim)
+    matrix = np.empty((n_vocab, dim), dtype=cupy.float32)
+    word2id = {}
+    id2word = {}
+
+    for i, line in enumerate(f):
+        word, vec_str = line.split(' ', 1)
+        word2id[word] = i
+        id2word[i] = word
+        matrix[i] = np.fromstring(vec_str, sep=' ')
+
+    return word2id, id2word, matrix
 
 class Mapper:
-    def __init__(self, gen_emb, spec_emb, num_neighbors, ignore_exact_words=False):
+    def __init__(self, words, gen_emb, spec_emb, num_neighbors, ignore_exact_words=False):
+        self._words = words
         self._word2id = {word: i for i, word in enumerate(words)}
         self._gen_emb = gen_emb
-        self._gen_emb_norm = gen_emb / cupy.linalg.norm(gen_emb, axis=1)[:, None]
+        self._gen_emb_norm = gen_emb / np.linalg.norm(gen_emb, axis=1)[:, None]
         self._spec_emb = spec_emb
         self._num_neighbors = num_neighbors
         self._ignore_exact_words = ignore_exact_words
         self.output_dim = self._spec_emb.shape[1]
+
+    def to_gpu(self):
+        self._gen_emb = cupy.array(self._gen_emb)
+        self._gen_emb_norm = cupy.array(self._gen_emb_norm)
+        self._spec_emb = cupy.array(self._spec_emb)
 
     def get_neighobors(self, batch_emb, batch_words):
         # Normalize batch embeddings
@@ -60,70 +124,124 @@ class Mapper:
         nn_spec_emb = self._spec_emb[nn_idx]
         ret = cupy.einsum('ijk,ij->ik', nn_spec_emb, weights)
 
-        return ret
+        return ret, weights
+
+
+class LinearMapper:
+    def __init__(self, words, gen_emb, spec_emb, orthogonal):
+        self._word2id = {word: i for i, word in enumerate(words)}
+        self._gen_emb = gen_emb
+        self._spec_emb = spec_emb
+        self.output_dim = self._spec_emb.shape[1]
+
+        self._othogonal = orthogonal
+
+    def to_gpu(self):
+        self._gen_emb = cupy.array(self._gen_emb)
+        self._spec_emb = cupy.array(self._spec_emb)
+
+    def learn_map(self):
+        if self._othogonal:
+            self.learn_orth_map()
+        else:
+            self.learn_unconst_map()
+
+    def learn_orth_map(self):
+        u, s, vt = cupy.linalg.svd(self._spec_emb.T.dot(self._gen_emb))
+        self.W = vt.T.dot(u.T)
+    
+    def learn_unconst_map(self):
+        x_pseudoinv = cupy.linalg.inv(self._gen_emb.T.dot(self._gen_emb)).dot(self._gen_emb.T)
+        self.W = x_pseudoinv.dot(self._spec_emb)
+
+    def __call__(self, batch_emb, batch_words):
+        return batch_emb.dot(self.W), None
 
 @click.command()
-@click.argument('src_emb_path', type=click.Path(exists=True))
-@click.argument('trg_emb_path', type=click.Path(exists=True))
+@click.argument('gen_emb_path', type=click.Path(exists=True))
+@click.argument('spec_emb_path', type=click.Path(exists=True))
 @click.option('--num-neighbors', type=int)
 @click.option('--batchsize', type=int, default=100)
-@click.option('--dictionary-type', type=click.Choice(['exact-match', 'file']))
-@click.option('--dictionary', type=click.Path(exists=True))
 @click.option('--ignore-exact-words/--no-ignore-exact-words', default=False)
-def main(src_emb_path, trg_emb_path, num_neighbors, dictionary_type, dictionary_type, 
-        ignore_exact_words=False, batchsize=1000):
-    logger.info("Load embeddings....", file=sys.stderr)
-    with open(src_emb_path) as f:
-        src_emb = utils.load_emb(f)
+@click.option('--linear/--llm', default=False)
+@click.option('--orthogonal/--unconstraint', default=False)
+@click.option('--weights-output-path', type=click.Path())
+def main(gen_emb_path, spec_emb_path, num_neighbors, ignore_exact_words, batchsize, linear, orthogonal, weights_output_path):
+    print("Load embeddings....", file=sys.stderr)
+    with open(gen_emb_path) as f:
+        gen_word2id, _, gen_emb = load_emb(f)
 
-    with open(trg_emb_path) as f:
-        trg_emb = utils.load_emb(f)
+    with open(spec_emb_path) as f:
+        spec_word2id, _, spec_emb = load_emb(f)
 
-    # Extract aligned vectors
-    if dictionary_type == 'file':
-        src_indicies = []
-        trg_indicies = []
+    # 語彙の共通部分の抽出する
+    print("Extracting intersection...", file=sys.stderr)
+    gen_words = set(gen_word2id.keys())
+    spec_words = set(spec_word2id.keys())
+    words = list(gen_words.intersection(spec_words))
 
-        with open(dictionary) as f:
-            for line in f:
-                src_word, trg_word = line.strip().split()
-                src_indicies.append(src_emb.vocab[src_word].index)
-                trg_indicies.append(trg_emb.vocab[trg_word].index)
-
-    elif dictionary_type == 'exact-match':
-        src_vocab = set(src_emb.vocab.keys())
-        trg_vocab = set(trg_emb.vocab.keys())
-        shared_vocab = src_vocab.intersection(trg_vocab)
-
-        src_indicies = [src_emb.vocab[word].index for word in shared_vocab]
-        trg_indicies = [trg_emb.vocab[word].index for word in shared_vocab]
-
-    src_aligned_vec = src_emb.vectors[src_indicies]
-    trg_aligned_vec = trg_emb.vectors[trg_indicies]
+    # 語彙の共通部分をindex化して、用いるword embeddingsを決定
+    gen_emb = gen_emb[[gen_word2id[word] for word in words]]
+    spec_emb = spec_emb[[spec_word2id[word] for word in words]]
 
     # GPUへ転送
-    logger.info("Sending embeddings to GPU...", file=sys.stderr)
-    src_aligned_vec = cupy.array(src_aligned_vec)
-    trg_aligned_vec = cupy.array(trg_aligned_vec)
+    #print("Sending embeddings to GPU...", file=sys.stderr)
+    #gen_emb = cupy.array(gen_emb)
+    #spec_emb = cupy.array(spec_emb)
 
     # Mapping Modelを作成
-    logger.info("Creating mapping model...", file=sys.stderr)
-    mapper = Mapper(src_aligned_vec, trg_aligned_vec, num_neighbors, ignore_exact_words)
+    print("Creating mapping model...", file=sys.stderr)
+    if linear:
+        mapper = LinearMapper(words, gen_emb, spec_emb, orthogonal)
+        mapper.to_gpu()
+        mapper.learn_map()
+    else:
+        mapper = Mapper(words, gen_emb, spec_emb, num_neighbors, ignore_exact_words)
+        mapper.to_gpu()
 
+    # 標準入力から分散表現を読んでLLM
+    batch_emb = cupy.empty((batchsize, gen_emb.shape[1]), dtype=cupy.float32)
+    batch_words = []
+
+    print("Mapping...", file=sys.stderr)
     n_vocab, _ = map(int, sys.stdin.readline().split())
 
     print("{} {}".format(n_vocab, mapper.output_dim))
 
-    for lines, in utils.batchfy((tqdm(enumerate(sys.stdin)),), batchsize=batchsize):
-        batch_words, batch_vec_strs = zip(*(line.split(' ', 1) for line in lines))
-        batch_vec = cupy.array([np.fromstring(vec_str) for vec_str in batch_vec_strs])
+    if not linear:
+        all_weights = np.empty(shape=(n_vocab, num_neighbors), dtype=np.float32)
 
-        batch_mapped_vec = mapper(batch_vec, batch_words)
+    for i, line in tqdm(enumerate(sys.stdin), total=n_vocab):
+        # embeddingをロード
+        word, vec_str = line.split(' ', 1)
+        batch_words.append(word)
+        batch_emb[i % batchsize] = cupy.array(np.fromstring(vec_str, sep=' '))
 
-        for i, word in enumerate(batch_words):
-            vec_str = ' '.join('{:.6f}'.format(float(v)) for v in batch_mapped_vec[i])
-            print('{} {}'.format(word, vec_str))
+        # batchsizeごとにmapして出力
+        if i % batchsize == batchsize - 1:
+            batch_spec_emb, weights = mapper(batch_emb, batch_words)
+
+            if not linear:
+                all_weights[i-weights.shape[0]+1:i+1] = cupy.asnumpy(weights)
+
+            for k, word in enumerate(batch_words):
+                vec_str = ' '.join('{:.6f}'.format(v) for v in cupy.asnumpy(batch_spec_emb[k]))
+                print('{} {}'.format(word, vec_str))
+
+            batch_words = []
+
+    # 余ってしまった分を写像
+    batch_spec_emb, weights = mapper(batch_emb, batch_words)
+
+    if not linear:
+        all_weights[i-weights.shape[0]:i] = cupy.asnumpy(weights)
+
+    for i, word in enumerate(batch_words):
+        vec_str = ' '.join('{:.6f}'.format(v) for v in cupy.asnumpy((batch_spec_emb[i])))
+        print('{} {}'.format(word, vec_str))
+
+    if weights_output_path is not None:
+        np.save(weights_output_path, all_weights)
 
 if __name__ == '__main__':
     main()
-

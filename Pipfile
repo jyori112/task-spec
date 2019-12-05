@@ -8,8 +8,14 @@ verify_ssl = true
 [packages]
 click = "*"
 torch = "*"
-cupy = "*"
 ipython = "*"
+jupyter = "*"
+matplotlib = "*"
+seaborn = "*"
+pandas = "*"
+cupy = "*"
+tqdm = "*"
+gensim = "*"
 
 [requires]
 python_version = "3.7"
