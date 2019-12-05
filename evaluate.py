@@ -9,7 +9,7 @@ import cupy
 
 from data import Vocab, Dataset
 from model import MultiClassModel
-from config import Config
+from utils import Config
 
 logger = logging.getLogger(__name__)
 LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(message)s (%(funcName)s@%(filename)s:%(lineno)s)'

@@ -6,7 +6,7 @@ import torch
 
 from data import Vocab
 from model import MultiClassModel
-from config import Config
+from utils import Config
 
 def compute_accuracy(x, y):
     return torch.mean((x == y).float())
